@@ -11,10 +11,15 @@
 	  2. Continuously scan for nearby players.
 	  3. Chase any player it can see within range.
 	  4. Return to patrolling when the player breaks line of sight or escapes.
+
+	Movement is driven by RunService.Heartbeat for smooth, frame-level updates.
+	The NPC advances to the next waypoint by proximity (no stopping between
+	waypoints) and skips waypoints it has already passed.
 --]]
 
 local PathfindingService = game:GetService("PathfindingService")
 local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
 
 --------------------------
 -- CONFIGURATION
@@ -36,6 +41,11 @@ local CONFIG = {
 	ChaseRePathDelay   = 0.3,   -- how often to recalculate path while chasing
 	LoseTargetTime     = 3,     -- seconds of no line-of-sight before giving up chase
 
+	-- Smooth movement
+	WaypointReachDist  = 4,     -- how close (studs) to a waypoint before advancing to next
+	SpeedLerpRate      = 4,     -- how fast WalkSpeed transitions (higher = snappier)
+	StuckTimeout       = 3,     -- seconds without progress before picking a new path
+
 	-- Pathfinding agent parameters (R15 rig dimensions)
 	AgentRadius        = 2,
 	AgentHeight        = 5,
@@ -52,8 +62,6 @@ local head: BasePart = npc:WaitForChild("Head")
 
 local spawnPosition = rootPart.Position
 
--- Parts belonging to the NPC (excluded from raycasts)
-local npcDescendants = npc:GetDescendants()
 local raycastParams = RaycastParams.new()
 raycastParams.FilterType = Enum.RaycastFilterType.Exclude
 raycastParams.FilterDescendantsInstances = {npc}
@@ -64,7 +72,9 @@ raycastParams.FilterDescendantsInstances = {npc}
 local currentState: string = "Patrol"  -- "Patrol" | "Chase"
 local currentTarget: Player? = nil
 local lastSeenTime: number = 0
-local currentPath: Path? = nil
+
+local targetSpeed: number = CONFIG.PatrolWalkSpeed
+local alive: boolean = true
 
 --------------------------
 -- HELPERS
@@ -96,14 +106,11 @@ local function hasLineOfSight(targetPosition: Vector3): boolean
 	local result = workspace:Raycast(origin, direction, raycastParams)
 
 	if result then
-		-- Something is in the way — check distance. If the hit is beyond
-		-- the target it means nothing blocked the path.
 		local distToTarget = direction.Magnitude
 		local distToHit = (result.Position - origin).Magnitude
 		return distToHit >= distToTarget - 1
 	end
 
-	-- Nothing hit at all — clear line of sight
 	return true
 end
 
@@ -144,34 +151,95 @@ local function findVisibleTarget(): Player?
 	return closestPlayer
 end
 
---- Walk along a computed path. Returns true if the NPC reached the end,
---- false if it was interrupted (state changed).
-local function followPath(path: Path, checkInterrupt: () -> boolean): boolean
-	local waypoints = path:GetWaypoints()
+--- Horizontal distance only (ignores Y), used for waypoint reach checks
+--- so slopes/stairs don't cause the NPC to overshoot waypoints.
+local function horizontalDist(a: Vector3, b: Vector3): number
+	local dx = a.X - b.X
+	local dz = a.Z - b.Z
+	return math.sqrt(dx * dx + dz * dz)
+end
 
-	for i = 2, #waypoints do
-		if checkInterrupt() then
-			return false
+--- Find the furthest waypoint the NPC can skip ahead to.
+--- This prevents the NPC from backtracking to waypoints it already passed.
+local function getNextWaypointIndex(waypoints: {PathWaypoint}, currentIndex: number): number
+	local best = currentIndex
+	for i = currentIndex, math.min(currentIndex + 3, #waypoints) do
+		local dist = horizontalDist(rootPart.Position, waypoints[i].Position)
+		if dist < CONFIG.WaypointReachDist then
+			best = math.min(i + 1, #waypoints)
 		end
+	end
+	return best
+end
 
-		local waypoint = waypoints[i]
+--- Smoothly follow a set of waypoints using MoveTo, advancing by proximity
+--- instead of waiting for MoveToFinished. Returns true if we reached the end.
+local function followPathSmooth(waypoints: {PathWaypoint}, checkInterrupt: () -> boolean): boolean
+	if #waypoints < 2 then return true end
 
+	local waypointIndex = 2
+	local lastPosition = rootPart.Position
+	local lastProgressTime = tick()
+
+	while waypointIndex <= #waypoints do
+		if checkInterrupt() then return false end
+		if not alive then return false end
+
+		-- Skip ahead past any waypoints we've already reached
+		waypointIndex = getNextWaypointIndex(waypoints, waypointIndex)
+		if waypointIndex > #waypoints then break end
+
+		local waypoint = waypoints[waypointIndex]
+
+		-- Handle jump waypoints
 		if waypoint.Action == Enum.PathWaypointAction.Jump then
 			humanoid.Jump = true
 		end
 
+		-- Issue MoveTo — Humanoid will walk toward this point
 		humanoid:MoveTo(waypoint.Position)
 
-		-- Wait for the NPC to reach the waypoint or get stuck
-		local reached = humanoid.MoveToFinished:Wait()
-		if not reached then
-			-- Stuck — break out so we can pick a new destination
+		-- Check if we've reached this waypoint
+		local dist = horizontalDist(rootPart.Position, waypoint.Position)
+		if dist < CONFIG.WaypointReachDist then
+			waypointIndex += 1
+			lastProgressTime = tick()
+		end
+
+		-- Stuck detection: if we haven't made meaningful progress, bail out
+		local moved = (rootPart.Position - lastPosition).Magnitude
+		if moved > 0.5 then
+			lastPosition = rootPart.Position
+			lastProgressTime = tick()
+		elseif tick() - lastProgressTime > CONFIG.StuckTimeout then
 			return false
 		end
+
+		-- Yield one frame — keeps movement smooth at Heartbeat rate
+		RunService.Heartbeat:Wait()
 	end
 
 	return true
 end
+
+--- Smoothly lerp WalkSpeed toward the target each frame.
+local function setTargetSpeed(speed: number)
+	targetSpeed = speed
+end
+
+--------------------------
+-- SMOOTH SPEED LERP (runs every frame)
+--------------------------
+
+RunService.Heartbeat:Connect(function(dt)
+	if not alive then return end
+	local diff = targetSpeed - humanoid.WalkSpeed
+	if math.abs(diff) < 0.1 then
+		humanoid.WalkSpeed = targetSpeed
+	else
+		humanoid.WalkSpeed += diff * math.min(CONFIG.SpeedLerpRate * dt, 1)
+	end
+end)
 
 --------------------------
 -- PATROL BEHAVIOR
@@ -179,18 +247,19 @@ end
 
 local function patrol()
 	currentState = "Patrol"
-	humanoid.WalkSpeed = CONFIG.PatrolWalkSpeed
+	setTargetSpeed(CONFIG.PatrolWalkSpeed)
 
 	while currentState == "Patrol" do
 		local destination = getRandomPatrolPoint()
 		local path = createPath()
 
-		local success, err = pcall(function()
+		local success = pcall(function()
 			path:ComputeAsync(rootPart.Position, destination)
 		end)
 
 		if success and path.Status == Enum.PathStatus.Success then
-			local completed = followPath(path, function()
+			local waypoints = path:GetWaypoints()
+			local completed = followPathSmooth(waypoints, function()
 				return currentState ~= "Patrol"
 			end)
 
@@ -198,10 +267,15 @@ local function patrol()
 				-- Pause briefly at the destination
 				local pauseTime = CONFIG.PatrolPauseMIN
 					+ math.random() * (CONFIG.PatrolPauseMAX - CONFIG.PatrolPauseMIN)
-				task.wait(pauseTime)
+
+				-- Interruptible wait (don't block the whole pause duration)
+				local waited = 0
+				while waited < pauseTime and currentState == "Patrol" do
+					local dt = RunService.Heartbeat:Wait()
+					waited += dt
+				end
 			end
 		else
-			-- Path failed — try a different point next loop
 			task.wait(0.5)
 		end
 	end
@@ -214,8 +288,10 @@ end
 local function chase(target: Player)
 	currentState = "Chase"
 	currentTarget = target
-	humanoid.WalkSpeed = CONFIG.ChaseRunSpeed
+	setTargetSpeed(CONFIG.ChaseRunSpeed)
 	lastSeenTime = tick()
+
+	local lastRepath = 0
 
 	while currentState == "Chase" do
 		local character = target.Character
@@ -230,53 +306,50 @@ local function chase(target: Player)
 		-- Check line of sight
 		if hasLineOfSight(targetRoot.Position) then
 			lastSeenTime = tick()
-		else
-			-- Lost sight — check if we've exceeded the give-up timer
-			if tick() - lastSeenTime >= CONFIG.LoseTargetTime then
-				break
-			end
+		elseif tick() - lastSeenTime >= CONFIG.LoseTargetTime then
+			break
 		end
 
-		-- Compute path toward player's current position
-		local path = createPath()
-		local success, err = pcall(function()
-			path:ComputeAsync(rootPart.Position, targetRoot.Position)
-		end)
+		-- Compute a fresh path periodically
+		if tick() - lastRepath >= CONFIG.ChaseRePathDelay then
+			lastRepath = tick()
 
-		if success and path.Status == Enum.PathStatus.Success then
-			local waypoints = path:GetWaypoints()
+			local path = createPath()
+			local success = pcall(function()
+				path:ComputeAsync(rootPart.Position, targetRoot.Position)
+			end)
 
-			for i = 2, math.min(#waypoints, 4) do
-				if currentState ~= "Chase" then break end
+			if success and path.Status == Enum.PathStatus.Success then
+				local waypoints = path:GetWaypoints()
 
-				local waypoint = waypoints[i]
-				if waypoint.Action == Enum.PathWaypointAction.Jump then
-					humanoid.Jump = true
+				-- Follow a few waypoints smoothly, then re-path
+				-- (limits how long we commit to a stale path)
+				local maxWaypoints = math.min(#waypoints, 6)
+				local trimmed = {}
+				for i = 1, maxWaypoints do
+					trimmed[i] = waypoints[i]
 				end
 
-				humanoid:MoveTo(waypoint.Position)
-
-				-- Don't wait for the full MoveToFinished — re-path frequently
-				local startTime = tick()
-				while tick() - startTime < CONFIG.ChaseRePathDelay do
-					-- Check if target moved significantly; if so, break early to re-path
-					if not target.Character then break end
-					local newRoot = target.Character:FindFirstChild("HumanoidRootPart")
-					if newRoot then
-						local distToWaypoint = (waypoint.Position - rootPart.Position).Magnitude
-						if distToWaypoint < 2 then break end
-					end
-					task.wait(0.05)
-				end
+				followPathSmooth(trimmed, function()
+					-- Interrupt if state changed OR it's time to re-path
+					if currentState ~= "Chase" then return true end
+					if tick() - lastRepath >= CONFIG.ChaseRePathDelay then return true end
+					return false
+				end)
+			else
+				-- Path failed — move directly toward player
+				humanoid:MoveTo(targetRoot.Position)
+				RunService.Heartbeat:Wait()
 			end
 		else
-			-- Path failed — try moving directly toward last known position
+			-- Between re-paths, keep walking toward the player directly
+			-- for a single frame so movement never stalls
 			humanoid:MoveTo(targetRoot.Position)
-			task.wait(CONFIG.ChaseRePathDelay)
+			RunService.Heartbeat:Wait()
 		end
 	end
 
-	-- Chase ended — go back to patrol
+	-- Chase ended — smoothly transition back to patrol
 	currentTarget = nil
 	patrol()
 end
@@ -286,7 +359,7 @@ end
 --------------------------
 
 task.spawn(function()
-	while true do
+	while alive do
 		task.wait(CONFIG.DetectionInterval)
 
 		if humanoid.Health <= 0 then break end
@@ -294,15 +367,12 @@ task.spawn(function()
 		if currentState == "Patrol" then
 			local target = findVisibleTarget()
 			if target then
-				-- Interrupt patrol and start chasing
 				currentState = "Chase"
 				task.defer(chase, target)
 			end
 		elseif currentState == "Chase" and currentTarget then
-			-- While chasing, check if a closer player is now visible
 			local newTarget = findVisibleTarget()
 			if newTarget and newTarget ~= currentTarget then
-				-- Switch targets if the new one is closer
 				local currentChar = currentTarget.Character
 				local newChar = newTarget.Character
 				if currentChar and newChar then
@@ -325,17 +395,16 @@ end)
 -- ENTRY POINT
 --------------------------
 
--- Clean up if the NPC is destroyed
 npc.AncestryChanged:Connect(function()
 	if not npc:IsDescendantOf(workspace) then
 		currentState = "None"
+		alive = false
 	end
 end)
 
--- Also stop if the NPC dies
 humanoid.Died:Connect(function()
 	currentState = "None"
+	alive = false
 end)
 
--- Start patrolling
 patrol()
